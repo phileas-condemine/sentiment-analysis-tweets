@@ -1,0 +1,241 @@
+---
+title: "sentiment analysis on trump tweets"
+output: html_document
+---
+
+```{r message=F, warning = F}
+library(data.table) # CSV file I/O, e.g. the read_csv function
+library(NLP)
+library(openNLP)
+library(plyr)
+library(RSentiment)
+library(gbm)
+library(verification)
+library(tm)
+library(topicmodels)
+```
+Note these tweets can't be easily updated because bs4 is not installed on the Kaggle Kernel.
+
+```{r}
+#system("pip install bs4")
+#system("python scrape.py")
+```
+
+First let's have a look at these tweets
+```{r}
+tweets=fread("data.csv")
+print("here are the latest tweets")
+head(tweets)
+print("here are the available variables")
+names(tweets)
+```
+
+Boilerplate code from openNLP R Documentation Examples related to function Maxent_POS_Tag_Annotator.
+It will extract the synthaxic role of each word.
+```{r}
+s=as.String(tweets$Text[1])
+print(s)
+## Need sentence and word token annotations.
+sent_token_annotator <- Maxent_Sent_Token_Annotator()
+word_token_annotator <- Maxent_Word_Token_Annotator()
+a2 <- annotate(s, list(sent_token_annotator, word_token_annotator))
+
+pos_tag_annotator <- Maxent_POS_Tag_Annotator()
+pos_tag_annotator
+a3 <- annotate(s, pos_tag_annotator, a2)
+a3
+## Variant with POS tag probabilities as (additional) features.
+head(annotate(s, Maxent_POS_Tag_Annotator(probs = TRUE), a2))
+
+## Determine the distribution of POS tags for word tokens.
+a3w <- subset(a3, type == "word")
+tags <- sapply(a3w$features, `[[`, "POS")
+tags
+table(tags)
+## Extract token/POS pairs (all of them): easy.
+sprintf("%s/%s", s[a3w], tags)
+```
+Now let's see if we can identify a person in the tweets.
+```{r}
+len = 0
+i=1
+sent_token_annotator <- Maxent_Sent_Token_Annotator()
+word_token_annotator <- Maxent_Word_Token_Annotator()
+entity_annotator <- Maxent_Entity_Annotator(language="en",kind="person",probs=TRUE)
+entity_annotator
+while (len ==0){
+print(i)
+s=as.String(tweets$Text[i])
+print(s)
+## Need sentence and word token annotations.
+a2 <- annotate(s, list(sent_token_annotator, word_token_annotator))
+## Entity recognition for persons.
+annotate(s, entity_annotator, a2)
+## Directly:
+entity_annotator(s, a2)
+persons = s[entity_annotator(s,a2)]
+len=length(persons)
+i=i+1
+}
+
+## Variant with sentence probabilities as features.
+annotate(s, Maxent_Entity_Annotator(probs = TRUE), a2)
+
+```
+It's not 100% working, it did not annotate Hillary as a person but annotated Carlos Slim. Maybe it needs first name & last name.
+
+Prepare the text for sentiment analysis
+```{r}
+some_txt=c(tweets$Text)
+# remove retweet entities
+some_txt = gsub("(RT|via)((?:\\b\\W*@\\w+)+)", "", some_txt)
+# remove at people
+some_txt = gsub("@\\w+", "", some_txt)
+# remove punctuation
+some_txt = gsub("[[:punct:]]", " ", some_txt)
+# remove numbers
+some_txt = gsub("[[:digit:]]", "", some_txt)
+# remove html links
+some_txt = gsub("http\\w+", "", some_txt)
+# remove unnecessary spaces
+some_txt = gsub("[ \t]{2,}", " ", some_txt)
+some_txt = gsub("^\\s+|\\s+$", " ", some_txt)
+
+# define "tolower error handling" function 
+try.error = function(x)
+{
+   # create missing value
+   y = NA
+   # tryCatch error
+   try_error = tryCatch(tolower(x), error=function(e) e)
+   # if not an error
+   if (!inherits(try_error, "error"))
+   y = tolower(x)
+   # result
+   return(y)
+}
+# lower case using try.error with sapply 
+some_txt = sapply(some_txt, try.error)
+
+# remove NAs in some_txt
+some_txt = some_txt[!is.na(some_txt)]
+names(some_txt) = NULL
+
+```
+
+Let's see how to make simple sentiment analysis with RSentiment
+```{r}
+length(some_txt)
+size=1000
+calculate_total_presence_sentiment(c("This is good","This is bad"))
+system.time(sentiments_raw<-sapply(some_txt[1:size],function(x){
+return(c(calculate_total_presence_sentiment(x)[2,]))
+}))
+sentiments_DT=data.table(t(matrix(sentiments_raw,nrow=6)))
+names(sentiments_DT)<-c("Sarcasm","Neutral","Negative","Positive","Very Negative","Very Positive")
+for (nm in names(sentiments_DT)){
+sentiments_DT[[nm]]<-as.numeric(sentiments_DT[[nm]])
+}
+save(file="sentiments.RData",list=c("sentiments_DT"))
+
+colSums(sentiments_DT)
+stats=data.table()
+for (nm in names(sentiments_DT)){
+nb=sum(sentiments_DT[[nm]])
+stats=rbind(stats,data.table(name=nm,fav_average=sum(sentiments_DT[[nm]]*tweets$Favorites[1:size])/nb,
+retweet_average=sum(sentiments_DT[[nm]]*tweets$Retweets[1:size])/nb,
+volume=nb))
+}
+stats=stats[stats$volume>0]
+stats$name=factor(stats$name)
+```
+Of course the extremes are more popular.
+```{r}
+stats
+plot(x=stats$name,y=stats$fav_average)
+```
+
+Let's build a silly sentiment score to model sentiments
+
+```{r}
+tweets_sample=cbind(tweets[1:size],sentiments_DT)
+weights=c("sarcasm"=-2,"neutral"=0,"Negative"=-1,"positive"=1,"very_negative"=-2,"very_positive"=2)
+weights
+score=apply(sentiments_DT,1,function(x){
+sum(x*weights)
+})
+head(score)
+tweets_sample$sentiment_score=score
+tweets_sample$tweet_length=nchar(tweets_sample$Text)
+names(tweets_sample)
+
+modelling_var=c("Favorites","Retweets","tweet_length")
+
+for (nm in modelling_var){
+tweets_sample[[nm]]=as.numeric(as.character(tweets_sample[[nm]]))
+}
+```
+
+Little data preparation
+```{r}
+tweets_sample$Favorites=log(tweets_sample$Favorites) # this won't change anything to the GBM result but the dependency plots will be more interpretable
+tweets_sample$Retweets=log(tweets_sample$Retweets)
+```
+
+Now build a simple model
+```{r}
+train_sample=sample(1:size,round(0.7*size))
+gbm_params=c(shrinkage=0.002,nb_trees=500,depth=2)
+summary(tweets_sample)
+gbm_model=gbm(sentiment_score ~Favorites+Retweets+tweet_length,
+data=tweets_sample[train_sample],shrinkage=gbm_params[1],
+n.trees=gbm_params[2],interaction.depth=gbm_params[3],verbose=TRUE,
+train.fraction=0.7)
+summary(gbm_model)
+plot(gbm_model,i.var=1)
+plot(gbm_model,i.var=2)
+plot(gbm_model,i.var=3)
+plot(gbm_model,i.var=c(1,2))
+plot(gbm_model,i.var=c(1,3))
+plot(gbm_model,i.var=c(2,3))
+
+pred = predict(newdata=tweets_sample[-train_sample],object=gbm_model)
+pred_sign = pred
+pred_extreme = abs(pred)
+
+obs = tweets_sample[-train_sample]$sentiment_score
+gini_sign = (roc.area(obs=1*(obs>0),pred=pred_sign)$A -1/2)*2
+gini_extreme = (roc.area(obs=1*(abs(obs)>1),pred=pred_extreme)$A -1/2)*2
+gini_sign
+gini_extreme
+```
+
+Let's improve our model with new features.
+For that, we are going to make topics modelling.
+
+```{r}
+strsplit_space_tokenizer=function(x)
+  unlist(strsplit(as.character(x), "[[:space:]]+"))
+ctrl=list(tokenize = strsplit_space_tokenizer,
+             removePunctuation = list(preserve_intra_word_dashes = TRUE),
+             stemming = TRUE,
+             wordLengths = c(4, Inf),
+             language="en")
+TF_CTRL=termFreq(tweets_sample$Text, control = ctrl)
+findMostFreqTerms(TF_CTRL,n = 30)
+topics_number=10
+topics = LDA(x = TF_CTRL,k = topics_number,method="Gibbs")
+summary(topics)
+
+library(tidytext)
+library(ggplot2)
+getTopicToClaimDistribution = function(ldaModel){
+  ldaGamma <- tidytext::tidy(ldaModel, matrix = "gamma")
+  ldaGamma
+}
+
+getTopicToClaimDistribution(topics)
+#lda_inf = posterior(topics,tweets_sample$Text)
+```
+
+Any results you write to the current directory are saved as output.
